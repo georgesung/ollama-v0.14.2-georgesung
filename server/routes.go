@@ -209,6 +209,8 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		return
 	}
 
+	logLLMRequest(req)
+
 	if req.TopLogprobs < 0 || req.TopLogprobs > 20 {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "top_logprobs must be between 0 and 20"})
 		return
@@ -601,6 +603,11 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 					}
 					res.Context = tokens
 				}
+
+				// log the full response
+				logRes := res
+				logRes.Response = sb.String()
+				logLLMResponse(logRes)
 			}
 
 			if builtinParser != nil {
@@ -1923,6 +1930,8 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		return
 	}
 
+	logLLMRequest(req)
+
 	if req.TopLogprobs < 0 || req.TopLogprobs > 20 {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "top_logprobs must be between 0 and 20"})
 		return
@@ -2191,6 +2200,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 
 		for {
 			var tb strings.Builder
+			var sb strings.Builder
 
 			currentFormat := req.Format
 			// structured outputs via double request is enabled when:
@@ -2218,6 +2228,8 @@ func (s *Server) ChatHandler(c *gin.Context) {
 				Logprobs:    req.Logprobs,
 				TopLogprobs: req.TopLogprobs,
 			}, func(r llm.CompletionResponse) {
+				sb.WriteString(r.Content)
+
 				res := api.ChatResponse{
 					Model:     req.Model,
 					CreatedAt: time.Now().UTC(),
@@ -2236,6 +2248,10 @@ func (s *Server) ChatHandler(c *gin.Context) {
 					res.DoneReason = r.DoneReason.String()
 					res.TotalDuration = time.Since(checkpointStart)
 					res.LoadDuration = checkpointLoaded.Sub(checkpointStart)
+
+					logRes := res
+					logRes.Message.Content = sb.String()
+					logLLMResponse(logRes)
 				}
 
 				if builtinParser != nil {
@@ -2459,4 +2475,42 @@ func filterThinkTags(msgs []api.Message, m *Model) []api.Message {
 		}
 	}
 	return msgs
+}
+
+func logLLMRequest(req interface{}) {
+	f, err := os.OpenFile("./ollama_llm_debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		slog.Error("failed to open llm_debug.log", "error", err)
+		return
+	}
+	defer f.Close()
+
+	b, err := json.MarshalIndent(req, "", "  ")
+	if err != nil {
+		slog.Error("failed to marshal request", "error", err)
+		return
+	}
+
+	if _, err := f.WriteString(">>> REQUEST " + time.Now().Format(time.RFC3339) + "\n" + string(b) + "\n\n"); err != nil {
+		slog.Error("failed to write to llm_debug.log", "error", err)
+	}
+}
+
+func logLLMResponse(resp interface{}) {
+	f, err := os.OpenFile("./ollama_llm_debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		slog.Error("failed to open llm_debug.log", "error", err)
+		return
+	}
+	defer f.Close()
+
+	b, err := json.MarshalIndent(resp, "", "  ")
+	if err != nil {
+		slog.Error("failed to marshal response", "error", err)
+		return
+	}
+
+	if _, err := f.WriteString("<<< RESPONSE " + time.Now().Format(time.RFC3339) + "\n" + string(b) + "\n\n"); err != nil {
+		slog.Error("failed to write to llm_debug.log", "error", err)
+	}
 }
