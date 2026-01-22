@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -232,6 +233,7 @@ type StreamErrorEvent struct {
 
 // FromMessagesRequest converts an Anthropic MessagesRequest to an Ollama api.ChatRequest
 func FromMessagesRequest(r MessagesRequest) (*api.ChatRequest, error) {
+	logAnthropicData("REQUEST", r)
 	var messages []api.Message
 
 	if r.System != nil {
@@ -482,7 +484,7 @@ func ToMessagesResponse(id string, r api.ChatResponse) MessagesResponse {
 
 	stopReason := mapStopReason(r.DoneReason, len(r.Message.ToolCalls) > 0)
 
-	return MessagesResponse{
+	resp := MessagesResponse{
 		ID:         id,
 		Type:       "message",
 		Role:       "assistant",
@@ -494,6 +496,8 @@ func ToMessagesResponse(id string, r api.ChatResponse) MessagesResponse {
 			OutputTokens: r.Metrics.EvalCount,
 		},
 	}
+	logAnthropicData("RESPONSE", resp)
+	return resp
 }
 
 // mapStopReason converts Ollama done_reason to Anthropic stop_reason
@@ -527,6 +531,10 @@ type StreamConverter struct {
 	thinkingDone    bool
 	textStarted     bool
 	toolCallsSent   map[string]bool
+
+	fullThinking  strings.Builder
+	fullContent   strings.Builder
+	fullToolCalls []api.ToolCall
 }
 
 func NewStreamConverter(id, model string) *StreamConverter {
@@ -546,6 +554,13 @@ type StreamEvent struct {
 
 // Process converts an Ollama ChatResponse to Anthropic streaming events
 func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
+	if r.Message.Thinking != "" {
+		c.fullThinking.WriteString(r.Message.Thinking)
+	}
+	if r.Message.Content != "" {
+		c.fullContent.WriteString(r.Message.Content)
+	}
+
 	var events []StreamEvent
 
 	if c.firstWrite {
@@ -646,6 +661,8 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 			continue
 		}
 
+		c.fullToolCalls = append(c.fullToolCalls, tc)
+
 		if c.textStarted {
 			events = append(events, StreamEvent{
 				Event: "content_block_stop",
@@ -743,12 +760,49 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 				Type: "message_stop",
 			},
 		})
+
+		// Log full response
+		fullResp := MessagesResponse{
+			ID:         c.ID,
+			Type:       "message",
+			Role:       "assistant",
+			Model:      c.Model,
+			Content:    []ContentBlock{},
+			StopReason: stopReason,
+			Usage: Usage{
+				InputTokens:  c.inputTokens,
+				OutputTokens: c.outputTokens,
+			},
+		}
+
+		if c.fullThinking.Len() > 0 {
+			fullResp.Content = append(fullResp.Content, ContentBlock{
+				Type:     "thinking",
+				Thinking: ptr(c.fullThinking.String()),
+			})
+		}
+		if c.fullContent.Len() > 0 {
+			fullResp.Content = append(fullResp.Content, ContentBlock{
+				Type: "text",
+				Text: ptr(c.fullContent.String()),
+			})
+		}
+		for _, tc := range c.fullToolCalls {
+			fullResp.Content = append(fullResp.Content, ContentBlock{
+				Type:  "tool_use",
+				ID:    tc.ID,
+				Name:  tc.Function.Name,
+				Input: tc.Function.Arguments,
+			})
+		}
+
+		logAnthropicData("STREAM RESPONSE", fullResp)
 	}
 
 	return events
 }
 
-// generateID generates a unique ID with the given prefix using crypto/rand
+// generateID generates a unique ID with the prefix using crypto/rand
 func generateID(prefix string) string {
 	b := make([]byte, 12)
 	if _, err := rand.Read(b); err != nil {
@@ -775,4 +829,23 @@ func mapToArgs(m map[string]any) api.ToolCallFunctionArguments {
 		args.Set(k, v)
 	}
 	return args
+}
+
+func logAnthropicData(prefix string, payload any) {
+	f, err := os.OpenFile("./anthropic_llm_debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		slog.Error("failed to open anthropic_llm_debug.log", "error", err)
+		return
+	}
+	defer f.Close()
+
+	b, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		slog.Error("failed to marshal payload", "error", err)
+		return
+	}
+
+	if _, err := f.WriteString(fmt.Sprintf(">>> %s %s\n%s\n\n", prefix, time.Now().Format(time.RFC3339), string(b))); err != nil {
+		slog.Error("failed to write to anthropic_llm_debug.log", "error", err)
+	}
 }
