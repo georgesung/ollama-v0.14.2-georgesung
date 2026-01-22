@@ -233,6 +233,13 @@ type StreamErrorEvent struct {
 
 // FromMessagesRequest converts an Anthropic MessagesRequest to an Ollama api.ChatRequest
 func FromMessagesRequest(r MessagesRequest) (*api.ChatRequest, error) {
+	if fallback := os.Getenv("OLLAMA_ANTHROPIC_FALLBACK_MODEL"); fallback != "" {
+		if strings.HasPrefix(r.Model, "claude-") {
+			slog.Info("anthropic model fallback", "original", r.Model, "fallback", fallback)
+			r.Model = fallback
+		}
+	}
+
 	logAnthropicData("REQUEST", r)
 	var messages []api.Message
 
